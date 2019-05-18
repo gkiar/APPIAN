@@ -3,7 +3,6 @@ import matplotlib
 matplotlib.use('Agg')
 import nipype.pipeline.engine as pe
 import nipype.interfaces.utility as niu 
-import pyminc.volumes.factory as pyminc
 from sklearn.metrics import normalized_mutual_info_score
 from sklearn.ensemble import IsolationForest
 from sklearn.cluster import DBSCAN
@@ -19,25 +18,27 @@ from os.path import basename
 from sys import argv, exit
 from glob import glob
 from Quality_Control.outlier import lof, kde, MAD, lcf
-from pyminc.volumes.factory import *
+from Extra.concat import concat_df
+from nipype.interfaces.base import (TraitedSpec, File, traits, InputMultiPath, 
+                                    BaseInterface, OutputMultiPath, BaseInterfaceInputSpec, isdefined)
+from scipy.ndimage.filters import gaussian_filter
+from nipype.utils.filemanip import (load_json, save_json, split_filename, fname_presuffix, copyfile)
+import nibabel as nib
 import ntpath
 import nipype.pipeline.engine as pe
 import nipype.interfaces.utility as niu
-from nipype.interfaces.base import (TraitedSpec, File, traits, InputMultiPath, 
-                                    BaseInterface, OutputMultiPath, BaseInterfaceInputSpec, isdefined)
-from nipype.utils.filemanip import (load_json, save_json, split_filename, fname_presuffix, copyfile)
 import nipype.interfaces.io as nio
-from Extra.concat import concat_df
 import matplotlib.pyplot as plt
 import seaborn as sns
 import inspect
-from scipy.ndimage.filters import gaussian_filter
 ######################
 #   Group-level QC   #
 ######################
 
 #datasink for dist metrics
 #check how the calc outlier measure node is implemented, may need to be reimplemented
+
+final_dir="qc"
 
 def group_level_qc(opts, args):
     #setup workflow
@@ -50,12 +51,13 @@ def group_level_qc(opts, args):
     datasink.inputs.substitutions = [('_cid_', ''), ('sid_', '')]
 
     outfields=['coreg_metrics','tka_metrics','pvc_metrics']
-    paths={'coreg_metrics':"*/coreg_qc_metrics/*_distance_metric.csv", 'tka_metrics':"*/results_tka/*_3d.csv",'pvc_metrics':"pvc_qc_metrics/*_pvc_qc_metric.csv"}
+    paths={'coreg_metrics':"*/coreg_qc_metrics/*_metric.csv", 'tka_metrics':"*/results_tka/*_3d.csv",'pvc_metrics':"*/pvc_qc_metrics/*qc_metric.csv"}
 
     #If any one of the sets of metrics does not exist because it has not been run at the scan level, then 
     #remove it from the list of outfields and paths that the datagrabber will look for.
     for  outfield, path in paths.items(): # zip(paths, outfields):
         full_path = opts.targetDir + os.sep + opts.preproc_dir + os.sep + path
+        print(full_path)
         if len(glob(full_path)) == 0 :
             outfields.remove(outfield)
             paths.pop(outfield)
@@ -66,7 +68,7 @@ def group_level_qc(opts, args):
     datasource.inputs.template = '*'
     datasource.inputs.field_template = paths
     #datasource.inputs.template_args = dict( coreg_metrics = [['preproc_dir']] )
-
+    
     ##################
     # Coregistration #
     ##################
@@ -149,8 +151,10 @@ def group_level_qc(opts, args):
 __NBINS=-1
 import copy
 def pvc_mse(pvc_fn, pve_fn, fwhm):
-    pvc = pyminc.volumeFromFile(pvc_fn)
-    pve = pyminc.volumeFromFile(pve_fn)
+    pvc = nib.load(pvc_fn)
+    pvc.data = pvc.get_data()
+    pve = nib.load(pve_fn)
+    pve.data = pve.get_data()
     mse = 0 
     if len(pvc.data.shape) > 3 :#if volume has more than 3 dimensions
         t = int(pvc.sizes[0]/2)
@@ -185,40 +189,54 @@ def temp_qc(vol0, mask0, vol1, mask1, out_fn):
     print out_fn
     plt.savefig(out_fn)
 
-def distance(pet_fn, mri_fn, t1_brain_fn, pet_brain_fn, dist_f_list):
-    pet = pyminc.volumeFromFile(pet_fn)
-    mri = pyminc.volumeFromFile(mri_fn)
-    t1_mask= pyminc.volumeFromFile(t1_brain_fn)
-    pet_mask= pyminc.volumeFromFile(pet_brain_fn)
+#def distance(pet_fn, mri_fn, t1_brain_fn, pet_brain_fn, dist_f_list):
+def distance(pet_fn, mri_fn, t1_brain_fn, dist_f_list):
+    pet = nib.load(pet_fn)
+    pet.data = pet.get_data()
 
+    mri = nib.load(mri_fn)
+    mri.data = mri.get_data()
+
+    t1_mask= nib.load(t1_brain_fn)
+    t1_mask.data = t1_mask.get_data()
+
+    pet_mask= nib.load(pet_brain_fn)
+    pet_mask.data = pet_mask.get_data()
 
     pet_data=pet.data.flatten()
     mri_data=mri.data.flatten()
     t1_mask_data=t1_mask.data.flatten()
-    pet_mask_data=pet_mask.data.flatten()
-    if not t1_mask_data.shape == pet_mask_data.shape : 
-        print("Dimension mismatch between pet and mri:", pet_fn, mri_fn)
-        print( pet_mask.data.shape, t1_mask.data.shape)
+    #pet_mask_data=pet_mask.data.flatten()
+    
+    if not pet.data.shape == mri.data.shape : 
+        print("Dimension mismatch between pet and mri:")
+        print(pet_fn, pet_mask.data.shape) 
+        print(mri_fn, t1_mask.data.shape)
         exit(1)
 
-    overlap = t1_mask_data * pet_mask_data
+    #if not t1_mask_data.shape == pet_mask_data.shape : 
+    #    print("Dimension mismatch between masks pet and mri:")
+    #    print(pet_brain_fn, pet_mask.data.shape) 
+    #    print(t1_brain_fn, t1_mask.data.shape)
+    #    exit(1)
+
+    overlap = t1_mask_data #* pet_mask_data
     overlap[ overlap >= 1 ] = 1
     #temp_qc(np.array(pet.data), np.array(mri.data), np.array(t1_mask.data+pet_mask.data), pet_mask.data, os.path.basename(pet_fn)+'.png')
-    print(pet_fn)
-    print(mri_fn)
-    print(t1_brain_fn)
-    print(pet_brain_fn)
+    #print(pet_fn)
+    #print(mri_fn)
+    #print(t1_brain_fn)
+    #print(pet_brain_fn)
     
-    raw_input()
     n=overlap.shape[0]
     masked_pet_data = [ pet_data[i] for i in range(n) if int(overlap[i])  == 1 ] 
     masked_mri_data = [ mri_data[i] for i in range(n) if  int(overlap[i]) == 1 ] 
     del pet
     del mri
     del t1_mask
-    del pet_mask
+    #del pet_mask
     del t1_mask_data
-    del pet_mask_data
+    #del pet_mask_data
     dist_list=[]
     for dist_f in dist_f_list:
         dist_list.append(dist_f(masked_pet_data, masked_mri_data))
@@ -233,15 +251,7 @@ def mi(masked_pet_data, masked_mri_data):
     masked_pet_data = [int(round(x)) for x in masked_pet_data ]
     masked_mri_data = [int(round(x)) for x in masked_mri_data ]
     
-    #pet_nbins=find_nbins(masked_pet_data)
-    #mri_nbins=find_nbins(masked_mri_data)
     mi = normalized_mutual_info_score(masked_pet_data,masked_mri_data)
-    #p, pet_bins, mri_bins=joint_dist(masked_pet_data, masked_mri_data,pet_nbins, mri_nbins )
-    #mri_dist = np.histogram(masked_mri_data, mri_nbins)
-    #mri_dist = np.array(mri_dist[0], dtype=float) / np.sum(mri_dist[0])
-    #pet_dist = np.histogram(masked_pet_data, pet_nbins)
-    #pet_dist = np.array(pet_dist[0], dtype=float) / np.sum(pet_dist[0])
-    #mi=sum(p*np.log2(p/(pet_dist[pet_bins] * mri_dist[mri_bins]) ))
     
     print "MI:", mi
     return(mi)
@@ -348,6 +358,7 @@ def fse(masked_pet_data, masked_mri_data):
 def joint_dist(masked_pet_data, masked_mri_data, pet_nbins, mri_nbins):
     #return joint probability for pair of pet and mri value
     n=len(masked_pet_data)
+    print(pet_nbins, mri_nbins)
     h=np.histogram2d(masked_pet_data, masked_mri_data, [pet_nbins, mri_nbins])
     #print h
     nbins = h[0].shape[0] * h[0].shape[1]
@@ -369,10 +380,13 @@ def joint_dist(masked_pet_data, masked_mri_data, pet_nbins, mri_nbins):
     return [p, pet_bin, mri_bin]
 
 def find_nbins(array):
-    r=float(max(array)) - min(array)
-    
-    n=ceil(-np.log2(16/r))
-    return n
+    #r=float(max(array)) - min(array)
+    #n=ceil(-np.log2(16/r))
+    #n=len(array)
+    #iqr=np.diff(np.percentile(array, (25,75)))[0]
+    #x = ceil(2 * iqr / (n**(1/3)))
+    #x=3.5*np.std(array)/ (n**(1/3))
+    return 100
 
 ####################
 # Outlier Measures #
@@ -411,7 +425,7 @@ pvc_metrics={'MSE':pvc_mse }
 #outlier_measures={"KDE":kde, "LOF":lof, "IsolationForest":_IsolationForest, "MAD":MAD} #, "DBSCAN":_dbscan, "OneClassSVM":_OneClassSVM } 
 outlier_measures={  "KDE":kde } #,"LOF":lof, "DBSCAN":_dbscan, "OneClassSVM":_OneClassSVM } 
 
-metric_columns  = ['analysis', 'sub','ses','task','roi','metric','value']
+metric_columns  = ['analysis', 'sub','ses','task','run','acq','rec','roi','metric','value']
 outlier_columns = ['analysis', 'sub','ses','task','roi','metric','measure','value']
 
 
@@ -431,37 +445,47 @@ class pvc_qc_metricsInput(BaseInterfaceInputSpec):
     sub = traits.Str("Subject ID")
     task = traits.Str("Task")
     ses = traits.Str("Ses")
+    run = traits.Str("Run")
+    rec = traits.Str("Reconstruction")
+    acq = traits.Str("Acquisition")
     out_file = traits.File(desc="Output file")
 
 class pvc_qc_metrics(BaseInterface):
     input_spec = pvc_qc_metricsInput 
     output_spec = pvc_qc_metricsOutput
 
-    def _gen_output(self, sid, ses, task, fname ="pvc_qc_metric.csv"):
+    def _gen_output(self, sid, ses, task,run,acq,rec, fname ="pvc_qc_metric.csv"):
         dname = os.getcwd() 
-        return dname + os.sep + sid + '_' + ses + '_'+ task + "_" + fname
+        fn = dname+os.sep+'sub-'+sid+'_ses-'+ses+'_task-'+task
+        if isdefined(run) :
+            fn += '_run-'+str(run)
+        fn += "_acq-"+str(acq)+"_rec-"+str(rec)+fname
+        return fn
 
     def _run_interface(self, runtime):
         sub = self.inputs.sub
         ses = self.inputs.ses
         task = self.inputs.task
         fwhm = self.inputs.fwhm
+        run = self.inputs.run
+        rec = self.inputs.rec
+        acq = self.inputs.acq
         df = pd.DataFrame([], columns=metric_columns)
         
         for metric_name, metric_function in pvc_metrics.items():
             mse = pvc_mse(self.inputs.pvc, self.inputs.pve, fwhm)
-            temp = pd.DataFrame([['pvc', sub,ses,task,02,metric_name,mse]], columns=metric_columns)
+            temp = pd.DataFrame([['pvc', sub,ses,task,run,acq,rec,02,metric_name,mse]], columns=metric_columns)
             df = pd.concat([df, temp])
         df.fillna(0, inplace=True)
         if not isdefined(self.inputs.out_file):
-            self.inputs.out_file = self._gen_output(self.inputs.sub, self.inputs.ses, self.inputs.task)
+            self.inputs.out_file = self._gen_output(self.inputs.sub, self.inputs.ses, self.inputs.task, self.inputs.run, self.inputs.acq, self.inputs.rec)
         df.to_csv(self.inputs.out_file, index=False)
         return runtime
 
     def _list_outputs(self):
         outputs = self.output_spec().get()
         if not isdefined(self.inputs.out_file):
-            self.inputs.out_file = self.inputs._gen_output(self.inputs.sid, self.inputs.cid)
+            self.inputs.out_file = self.inputs._gen_output(self.inputs.sid,self.inputs.ses, self.inputs.task, self.inputs.run, self.inputs.acq, self.inputs.rec)
         outputs["out_file"] = self.inputs.out_file
         return outputs
 
@@ -472,11 +496,14 @@ class coreg_qc_metricsOutput(TraitedSpec):
 class coreg_qc_metricsInput(BaseInterfaceInputSpec):
     pet = traits.File(exists=True, mandatory=True, desc="Input PET image")
     t1 = traits.File(exists=True, mandatory=True, desc="Input T1 MRI")
-    t1_brain_mask = traits.File(exists=True, mandatory=True, desc="Input T1 MRI")
-    pet_brain_mask = traits.File(exists=True, mandatory=True, desc="Input T1 MRI")
+    brain_mask_space_mri = traits.File(exists=True, mandatory=True, desc="Input T1 MRI")
+    #pet_brain_mask = traits.File(exists=True, mandatory=True, desc="Input T1 MRI")
     sid = traits.Str(desc="Subject")
     ses = traits.Str(desc="Session")
     task = traits.Str(desc="Task")
+    run = traits.Str(desc="Run")
+    rec = traits.Str(desc="Reconstruction")
+    acq = traits.Str(desc="Acquisition")
     study_prefix = traits.Str(desc="Study Prefix")
     out_file = traits.File(desc="Output file")
     clobber = traits.Bool(desc="Overwrite output file", default=False)
@@ -485,9 +512,13 @@ class coreg_qc_metricsCommand(BaseInterface):
     input_spec = coreg_qc_metricsInput 
     output_spec = coreg_qc_metricsOutput
   
-    def _gen_output(self, sid, ses, task, fname ="distance_metric.csv"):
+    def _gen_output(self, sid, ses, task, run, rec, acq, fname ="distance_metric.csv"):
         dname = os.getcwd() 
-        return dname + os.sep +'sub-'+ sid + '_ses-' + ses + '_task-' + task + '_' + fname
+        fn = dname+os.sep+'sub-'+sid+'_ses-'+ses+'_task-'+task
+        if isdefined(run) :
+            fn += '_run-'+str(run)
+        fn += "_acq-"+str(acq)+"_rec-"+str(rec)+fname
+        return fn 
 
     def _run_interface(self, runtime):
         sub_df=pd.DataFrame(columns=metric_columns )
@@ -496,8 +527,12 @@ class coreg_qc_metricsCommand(BaseInterface):
         sid = self.inputs.sid
         ses = self.inputs.ses
         task = self.inputs.task
-        t1_brain_mask = self.inputs.t1_brain_mask
-        pet_brain_mask = self.inputs.pet_brain_mask
+        run = self.inputs.run
+        rec = self.inputs.rec
+        acq = self.inputs.acq
+
+        brain_mask_space_mri = self.inputs.brain_mask_space_mri
+        #pet_brain_mask = self.inputs.pet_brain_mask
 
         path, ext = os.path.splitext(pet)
         base=basename(path)
@@ -506,15 +541,16 @@ class coreg_qc_metricsCommand(BaseInterface):
           
         distance_metric_methods=distance_metrics.values()
         distance_metric_names=distance_metrics.keys()
-        mis_metric=distance(pet, t1, t1_brain_mask, pet_brain_mask, distance_metric_methods )
+        #mis_metric=distance(pet, t1, brain_mask_space_mri, pet_brain_mask, distance_metric_methods )
+        mis_metric=distance(pet, t1, brain_mask_space_mri,  distance_metric_methods )
 
         df=pd.DataFrame(columns=metric_columns )
         for m,metric_name,metric_func in zip(mis_metric, distance_metric_names, distance_metric_methods):
-            temp=pd.DataFrame([['coreg',sid,ses,task,'01',metric_name,m]],columns=df.columns  ) 
+            temp=pd.DataFrame([['coreg',sid,ses,task,run,acq,rec,'01',metric_name,m]],columns=df.columns  ) 
             sub_df = pd.concat([sub_df, temp])
         
         if not isdefined( self.inputs.out_file) :
-            self.inputs.out_file = self._gen_output(self.inputs.sid, self.inputs.ses, self.inputs.task)
+            self.inputs.out_file = self._gen_output(self.inputs.sid, self.inputs.ses, self.inputs.task,self.inputs.run,self.inputs.rec,self.inputs.acq)
         
         sub_df.to_csv(self.inputs.out_file,  index=False)
         return runtime
@@ -522,8 +558,7 @@ class coreg_qc_metricsCommand(BaseInterface):
     def _list_outputs(self):
         outputs = self.output_spec().get()
         if not isdefined( self.inputs.out_file) :
-            self.inputs.out_file = self._gen_output( self.inputs.sid, self.inputs.cid)
-
+            self.inputs.out_file = self._gen_output(self.inputs.sid, self.inputs.ses, self.inputs.task,self.inputs.run,self.inputs.rec,self.inputs.acq)
         outputs["out_file"] = self.inputs.out_file
         return outputs
 
@@ -565,7 +600,8 @@ class plot_qcCommand (BaseInterface):
         else:
             print("Unrecognized data frame")
             exit(1)
-        
+        df["sub"]="sub: "+df["sub"].map(str)+" task: "+df["task"].map(str)+" ses: "+df["ses"].map(str) 
+        print(df)
         plt.clf()
         fig, ax = plt.subplots()
         plt.figure(1)

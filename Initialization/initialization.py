@@ -3,74 +3,163 @@ import numpy as np
 import tempfile
 import shutil
 import json
-import nipype.interfaces.minc as minc
-
-import minc as pyezminc
-from os.path import basename
-from math import *
-
-from pyminc.volumes.factory import *
-
+import ntpath
+import shutil
+import nibabel as nib
+import re
 import nipype.pipeline.engine as pe
 import nipype.interfaces.utility as niu
-from nipype.interfaces.base import (TraitedSpec, File, traits, InputMultiPath, 
-                                    BaseInterface, OutputMultiPath, BaseInterfaceInputSpec, isdefined)
+from nipype.interfaces.base import (TraitedSpec, File, traits, InputMultiPath,
+        BaseInterface, OutputMultiPath, BaseInterfaceInputSpec, isdefined)
 from nipype.utils.filemanip import (load_json, save_json, split_filename, fname_presuffix, copyfile)
-from Extra.minc_filemanip import update_minchd_json
-from nipype.interfaces.utility import Rename
-from nipype.interfaces.minc import Resample as ResampleCommand
-from Extra.info import  InfoCommand
-from Extra.modifHeader import ModifyHeaderCommand
-from Extra.reshape import  ReshapeCommand
+from math import *
+from time import gmtime, strftime
 from glob import glob
+from os.path import basename
+from Extra.utils import splitext
+from sets import Set
 
-def unique_file(files, attributes):
-	
-	if len(files) == 1: 
-		return(files[0])
-	
-	files = [ f for f in files if attributes[0] in f ]
-
-	if attributes == [] or len(files) == 0: return []
-	else: unique_file(files, attributes[1:])
-	return( files[0] ) 
+def pexit(pstring="Error", exitcode=1):
+    print(pstring)
+    exit(exitcode)
 
 
-def gen_args(opts, session_ids, task_ids, acq, rec, subjects):
-    args=[]
-    for sub in subjects:
-        print sub
-        for ses in session_ids:
-            for task in task_ids:
-				sub_arg='sub-'+sub
-				ses_arg='ses-'+ses
-				task_arg=rec_arg=acq_arg=""
-				
-				pet_fn=civet_fn=""
-				if not acq == None: acq_arg='acq-'+acq
-				if not rec == None: rec_arg='rec-'+rec
-				pet_string=opts.sourceDir+os.sep+ sub_arg + os.sep+ '_'+ ses_arg + os.sep+ 'pet/*'+ 'ses-'+ses+'*'+'task-'+ task  +'*_pet.mnc' 
-				pet_list=glob(pet_string)
-				if pet_list != []:
-					pet_fn = unique_file(pet_list,[sub, ses, task, acq, rec] )
-				civet_list=glob(opts.sourceDir+os.sep+ sub_arg + os.sep + '*/anat/*_T1w.mnc' )
-				if civet_list != []:
-					civet_fn = unique_file(civet_list,[sub, ses, task, acq, rec] )
-				if os.path.exists(pet_fn) and os.path.exists(civet_fn):
-					d={'task':task, 'ses':ses, 'sid':sub}
-					args.append(d)
-				else:
-					if not os.path.exists(pet_fn) :
-						print "Could not find PET for ", sub, ses, task, pet_fn
-					if not os.path.exists(civet_fn) :
-						print "Could not find CIVET for ", sub, ses, task, civet_fn
-    return args
+class pet_brain_maskOutput(TraitedSpec):
+    out_file  = File(desc="Headmask from PET volume")
+
+class pet_brain_maskInput(BaseInterfaceInputSpec):
+    in_file = File(exists=True, mandatory=True, desc="PET volume")
+    in_json = File(exists=True, mandatory=True, desc="PET json file")
+    out_file = File(desc="Head mask")
+    slice_factor = traits.Float(usedefault=True, default_value=0.25, desc="Value (between 0. to 1.) that is multiplied by the maximum of the slices of the PET image. Used to threshold slices. Lower value means larger mask")
+    total_factor = traits.Float(usedefault=True, default_value=0.333, desc="Value (between 0. to 1.) that is multiplied by the thresholded means of each slice. ")
+
+    clobber = traits.Bool(usedefault=True, default_value=True, desc="Overwrite output file")
+    run = traits.Bool(usedefault=True, default_value=True, desc="Run the commands")
+    verbose = traits.Int(usedefault=True, default_value=True, desc="Write messages indicating progress")
+
+class pet_brain_mask(BaseInterface):
+    input_spec = pet_brain_maskInput
+    output_spec = pet_brain_maskOutput
+    _suffix = "_brain_mask"
+
+    def _run_interface(self, runtime):
+        if not isdefined(self.inputs.out_file):
+            base = os.path.basename(self.inputs.in_file)
+            split = splitext(base)
+            self.inputs.out_file = os.getcwd() +os.sep + split[0] + self._suffix + split[1]
+            #Load PET 3D volume
+        infile = nib.load(self.inputs.in_file)
+        shape=infile.get_shape()
+        zmax=shape[2]
+        data=infile.get_data()
+        #Get max slice values and multiply by pet_mask_slice_threshold (0.25 by default)
+        slice_thresholds=np.amax(data, axis=(1,2)) * self.inputs.slice_factor
+        #Get mean for all values above slice_max
+        slice_mean_f=lambda t, d, i: float(np.mean(d[i, d[i,:,:] > t[i]]))
+        slice_mean = np.array([slice_mean_f(slice_thresholds, data, i) for i in range(zmax) ])
+        #Remove nan from slice_mean
+        slice_mean =slice_mean[ ~ np.isnan(slice_mean) ]
+        #Calculate overall mean from mean of thresholded slices
+        overall_mean = np.mean(slice_mean)
+        #Calcuate threshold
+        threshold = overall_mean * self.inputs.total_factor
+        #Apply threshold and create and write outputfile
+        
+        idx = data >= threshold
+        data[ idx ] = 1
+        data[~idx ] = 0
+
+        outfile = nib.Nifti1Image(data, infile.get_affine())
+        outfile.to_file(self.inputs.out_file)
+        return runtime
+
+    def _list_outputs(self):
+        outputs = self.output_spec().get()
+        if not isdefined(self.inputs.out_file):
+            self.inputs.out_file = fname_presuffix(self.inputs.in_file, suffix=self._suffix)
+        outputs["out_file"] = self.inputs.out_file
+        return outputs
+
+
+class header_output(TraitedSpec):
+    out_file=traits.File(desc="Input json header file")
+class header_input(BaseInterfaceInputSpec):
+    in_file=traits.File(exists=True,mandatory=True,desc="Input json header file")
+    out_file=traits.File(desc="Input json header file")
+    quant_method = traits.Str(desc="Quant method")
+
+class validate_header(BaseInterface):
+    input_spec = header_input
+    output_spec = header_output
+    
+    def _set_duration(self, d):
+        frame_times=[]
+        try :
+            frame_times = d["Time"]["FrameTimes"]["Values"]
+        except KeyError :
+            print("\nError Could not find Time:FrameTimes:Values in header\n")
+            exit(1)
+        FrameLengths=[]
+
+        c0=c1=1 #Time unit conversion variables. Time should be in seconds
+        try :
+            if d["Time"]["FrameTimes"]["Units"][0] == 'm' :
+                c0=60
+            elif d["Time"]["FrameTimes"]["Units"][0] == 'h' :
+                c0=60*60
+            if d["Time"]["FrameTimes"]["Units"][1] == 'm' :
+                c1=60
+            elif d["Time"]["FrameTimes"]["Units"][1] == 'h' :
+                c1=60*60
+        except KeyError :
+            print("\nError Could not find Time:FrameTimes:Units in header\n")
+            exit(1)
+
+        for s, e in frame_times :
+            FrameLengths.append(c1*e - c0*s)
+
+        d["Time"]["FrameTimes"]["Duration"] = FrameLengths
+        return d
+
+    def _run_interface(self, runtime):
+        if not isdefined(self.inputs.out_file) :
+            self.inputs.out_file=os.getcwd() +os.sep+ os.path.basename(self.inputs.in_file)
+        d=json.load(open(self.inputs.in_file,'r')) 
+        
+        fields=[["Time","FrameTimes","Units"],
+                ["Time","FrameTimes","Values"],
+                ]
+        if self.inputs.quant_method == "suv" :
+            fields.append([["Info","BodyWeight"],
+                    ["RadioChem", "InjectedRadioactivity"],
+                    ["InjectedRadioactivityUnits", "kBq"]])
+
+        for f in fields :
+            try :
+                test_dict=d
+                for key in f :
+                    test_dict=test_dict[key]
+            except ValueError :
+                pexit("Error: json header does not contain key: "+":".join(f)+"for file"+self.inputs.in_file)
+        d=self._set_duration(d)
+        json.dump(d,open(self.inputs.out_file,'w+'))
+        return runtime
+
+    def _list_outputs(self):
+        outputs = self.output_spec().get()
+        if not isdefined(self.inputs.out_file) :
+            self.inputs.out_file=os.getcwd() +os.sep+ os.path.basename(self.inputs.in_file)
+        outputs["out_file"] = self.inputs.out_file
+        return outputs
 
 class SplitArgsOutput(TraitedSpec):
     cid = traits.Str(mandatory=True, desc="Condition ID")
-    sid = traits.Str(mandatory=True, desc="Subject ID") 
+    sid = traits.Str(mandatory=True, desc="Subject ID")
     task = traits.Str(desc="Task ID")
     ses = traits.Str(desc="Session ID")
+    run = traits.Str(desc="Run ID")
+    #compression = traits.Str(desc="Compression")
     RoiSuffix = traits.Str(desc="Suffix for subject ROI")
 
 class SplitArgsInput(BaseInterfaceInputSpec):
@@ -78,358 +167,171 @@ class SplitArgsInput(BaseInterfaceInputSpec):
     ses = traits.Str(desc="Session ID")
     sid = traits.Str(desc="Subject ID")
     cid = traits.Str(desc="Condition ID")
-    #study_prefix = traits.Str(mandatory=True, desc="Study Prefix")
+    run = traits.Str(desc="Run ID")
+    ses_sub_only = traits.Bool(default_value=False, usedefault=True)
     RoiSuffix = traits.Str(desc="Suffix for subject ROI")
     args = traits.Dict(mandatory=True, desc="Overwrite output file")
 
 class SplitArgsRunning(BaseInterface):
     input_spec = SplitArgsInput
     output_spec = SplitArgsOutput
-
+    
     def _run_interface(self, runtime):
-       self.inputs.cid=self.inputs.args['ses']+'_'+self.inputs.args['task']
-       self.inputs.task=self.inputs.args['task']
-       self.inputs.ses=self.inputs.args['ses']
-       self.inputs.sid=self.inputs.args['sid']
-       if isdefined(self.inputs.RoiSuffix):
-           self.inputs.RoiSuffix=self.inputs.RoiSuffix
-       return runtime
+        cid=''
+        if not isdefined(self.inputs.ses) :
+            self.inputs.ses=self.inputs.args['ses']
+            cid = cid + '_' +self.inputs.args['ses']
+        if not isdefined(self.inputs.sid) :
+            self.inputs.sid=self.inputs.args['sid']
+        if self.inputs.ses_sub_only : return runtime
+
+        try :
+            self.inputs.task=self.inputs.args['task']
+            cid = cid + '_' +self.inputs.args['task']
+        except  KeyError:
+            pass
+
+        try:
+            self.inputs.run=self.inputs.args['run']
+            cid = cid + '_' +self.inputs.args['run']
+        except  KeyError:
+            pass
+        self.inputs.cid=cid
+
+        if isdefined(self.inputs.RoiSuffix):
+            self.inputs.RoiSuffix=self.inputs.RoiSuffix
+        return runtime
 
     def _list_outputs(self):
         outputs = self.output_spec().get()
-        outputs["cid"] = self.inputs.cid
-        outputs["sid"] = self.inputs.sid
-        outputs["ses"] = self.inputs.ses
-        outputs["task"] = self.inputs.task
+        if isdefined(self.inputs.cid):
+            outputs["cid"] = self.inputs.cid
+        if isdefined(self.inputs.sid):
+            outputs["sid"] = self.inputs.sid
+
+        if isdefined(self.inputs.ses):
+            outputs["ses"] = self.inputs.ses
+
+        if isdefined(self.inputs.task):
+            outputs["task"] = self.inputs.task
+
+        if isdefined(self.inputs.run):
+            outputs["run"] = self.inputs.run
+
         if isdefined(self.inputs.RoiSuffix):
             outputs["RoiSuffix"]= self.inputs.RoiSuffix
         return outputs
 
+class pet3DVolumeOutput(TraitedSpec):
+    out_file = File(desc="Image after centering")
 
+class pet3DVolumeInput(BaseInterfaceInputSpec):
+    in_file = File(position=0, argstr="%s", mandatory=True, desc="Image")
+    out_file = File(argstr="%s", desc="Image after centering")
+    verbose = traits.Int(argstr="-verbose", usedefault=True, default_value=True, desc="Write messages indicating progress")
 
+class pet3DVolume(BaseInterface):
+    input_spec = pet3DVolumeInput
+    output_spec = pet3DVolumeOutput
+    _suffix = "_3D"
 
-
-class MincHdrInfoOutput(TraitedSpec):
-    out_file = File(desc="Output file")
-    header = traits.Dict(desc="Dictionary")
-
-
-class MincHdrInfoInput(BaseInterfaceInputSpec):
-    in_file = File(exists=True, mandatory=True, desc="Native dynamic PET image")
-    out_file = File(desc="Output file")
-
-    clobber = traits.Bool(usedefault=True, default_value=True, desc="Overwrite output file")
-    run = traits.Bool(usedefault=True, default_value=True, desc="Run the commands")
-    verbose = traits.Bool(usedefault=True, default_value=True, desc="Write messages indicating progress")
-
-class MincHdrInfoRunning(BaseInterface):
-    input_spec = MincHdrInfoInput
-    output_spec = MincHdrInfoOutput
-    _suffix = ".info"
-    _params={}
+    def _gen_output(self, basefile, _suffix):
+        fname = ntpath.basename(basefile)
+        fname_list = splitext(fname) # [0]= base filename; [1] =extension
+        dname = os.getcwd()
+        return dname+ os.sep+fname_list[0] + _suffix + fname_list[1]
 
     def _run_interface(self, runtime):
         if not isdefined(self.inputs.out_file):
-            fname = os.path.splitext(os.path.basename(self.inputs.in_file))[0]
-            dname = os.getcwd() #os.path.dirname(self.inputs.nativeT1)
-            self.inputs.out_file = dname+ os.sep+fname + self._suffix
-        try:
-            os.remove(self.inputs.out_file)
-        except OSError:
-            pass
+            self.inputs.out_file = self._gen_output(self.inputs.in_file, self._suffix)
+        infile = nib.load(self.inputs.in_file)
+        shape=infile.get_shape()
 
-        class InfoOptions:
-            def __init__(self, command, variable, attribute, type_):
-                self.command = command
-                self.variable = variable
-                self.attribute = attribute
-                self.type_ = type_
+        if len(shape) >= 4 :
+            affine=infile.get_affine()
+            data = infile.get_data()
+            ti=np.argmin(data.shape)
+            dims = list(data.shape) 
+            dims.remove(dims[ti])
 
-        options = [ InfoOptions('-dimnames','time','dimnames','string'),
-                    InfoOptions('-varvalue time','time','frames-time','integer'),
-                    InfoOptions('-varvalue time-width','time','frames-length','integer') ]
+            nFrames = shape[ti]
+            rank=0.20
 
-        for opt in options:
-            run_mincinfo=InfoCommand()
-            run_mincinfo.inputs.in_file = self.inputs.in_file
-            run_mincinfo.inputs.out_file = self.inputs.out_file
-            run_mincinfo.inputs.opt_string = opt.command
-            run_mincinfo.inputs.json_var = opt.variable
-            run_mincinfo.inputs.json_attr = opt.attribute
-            run_mincinfo.inputs.json_type = opt.type_
-            run_mincinfo.inputs.error = 'unknown'
-
-            if self.inputs.verbose:
-                print run_mincinfo.cmdline
-            if self.inputs.run:
-                run_mincinfo.run()
-
-        img = pyezminc.Image(self.inputs.in_file, metadata_only=True)
-        hd = img.get_MINC_header()
-        for key in hd.keys():
-            self._params[key]={}
-            for subkey in hd[key].keys():
-                self._params[key][subkey]={}
-                data_in = hd[key][subkey]
-                var = str(key)
-                attr = str(subkey)
-                #Populate dictionary with some useful image parameters (e.g., world coordinate start values of dimensions)
-                self._params[key][subkey]=data_in 
-                update_minchd_json(self.inputs.out_file, data_in, var, attr)
-        
-        
-        fp=open(self.inputs.out_file)
-        header = json.load(fp)
-        fp.close()
-
-        self._params=header
-
+            first=int(floor(nFrames*rank))
+            last=nFrames
+            
+            volume_subsets=np.split(data, [first,last], axis=ti) 
+            volume_subset=volume_subsets[1]
+            
+            volume_average=np.mean(volume_subset, axis=ti)
+            print("Frames to concatenate -- First:", first, "Last:", last) 
+            outfile = nib.Nifti1Image(volume_average, affine)
+            nib.save(outfile, self.inputs.out_file)
+        else :
+            #If there is no "time" dimension (i.e., in 3D file), just copy the PET file
+            shutil.copy(self.inputs.in_file, self.inputs.out_file)
         return runtime
 
-
     def _list_outputs(self):
+        if not isdefined(self.inputs.out_file):
+            self.inputs.out_file = self._gen_output(self.inputs.in_file, self._suffix)
+
         outputs = self.output_spec().get()
         outputs["out_file"] = self.inputs.out_file
-        outputs["header"] = self._params
-        return outputs
 
-
-
-class VolCenteringOutput(TraitedSpec):
-    out_file = File(desc="Image after centering")
-
-class VolCenteringInput(BaseInterfaceInputSpec):
-    in_file = File(position=0, argstr="%s", mandatory=True, desc="Image")
-    out_file = File(argstr="%s", desc="Image after centering")
-
-    run = traits.Bool(argstr="-run", usedefault=True, default_value=True, desc="Run the commands")
-    verbose = traits.Bool(argstr="-verbose", usedefault=True, default_value=True, desc="Write messages indicating progress")
-
-class VolCenteringRunning(BaseInterface):
-	input_spec = VolCenteringInput
-	output_spec = VolCenteringOutput
-	_suffix = "_center"
-
-
-	def _run_interface(self, runtime):
-		if not isdefined(self.inputs.out_file):
-			fname = os.path.splitext(os.path.basename(self.inputs.in_file))[0]
-			dname = dname = os.getcwd()
-			self.inputs.out_file = dname + os.sep + fname + self._suffix + '.mnc'
-
-
-		shutil.copy(self.inputs.in_file, self.inputs.out_file)
-		infile = volumeFromFile(self.inputs.in_file)
-		for view in ['xspace','yspace','zspace']:
-			start = -1*infile.separations[infile.dimnames.index(view)]*infile.sizes[infile.dimnames.index(view)]/2
-
-
-		run_modifHrd=ModifyHeaderCommand()
-		run_modifHrd.inputs.in_file = self.inputs.out_file;
-		run_modifHrd.inputs.dinsert = True;
-		run_modifHrd.inputs.opt_string = view+":start="+str(start);
-		
-		if self.inputs.run:
-			run_modifHrd.run()
-
-		return runtime
-
-
-	def _list_outputs(self):
-		outputs = self.output_spec().get()
-		outputs["out_file"] = self.inputs.out_file
-
-		return outputs
-
-class get_stepOutput(TraitedSpec):
-    step =traits.Str(desc="Step size (X, Y, Z)")
-
-class get_stepInput(BaseInterfaceInputSpec):
-    in_file = File(position=0, argstr="%s", mandatory=True, desc="Step size (X, Y, Z)")
-    step = traits.Str( desc="Image after centering")
-
-
-class get_stepCommand(BaseInterface):
-    input_spec = get_stepInput
-    output_spec = get_stepOutput
-
-    def _run_interface(self, runtime):
-    	img = volumeFromFile(self.inputs.in_file)
-        zi=img.dimnames.index('zspace')
-        yi=img.dimnames.index('yspace')
-        xi=img.dimnames.index('xspace')
-        zstep = img.separations[zi]
-        ystep = img.separations[yi]
-        xstep = img.separations[xi]
-        self.inputs.step = str(xstep) +' ' + str(ystep) +' '+str(zstep)
-        return runtime
-
-    def _list_outputs(self):
-        outputs = self.output_spec().get()
-        outputs["step"] = self.inputs.step
-        return outputs
-
-
-
-class PETexcludeFrOutput(TraitedSpec):
-    out_file = File(desc="Image after centering")
-
-class PETexcludeFrInput(BaseInterfaceInputSpec):
-    in_file = File(position=0, argstr="%s", mandatory=True, desc="Image")
-    out_file = File(argstr="%s", desc="Image after centering")
-
-    run = traits.Bool(argstr="-run", usedefault=True, default_value=True, desc="Run the commands")
-    verbose = traits.Bool(argstr="-verbose", usedefault=True, default_value=True, desc="Write messages indicating progress")
-
-class PETexcludeFrRunning(BaseInterface):
-    input_spec = PETexcludeFrInput
-    output_spec = PETexcludeFrOutput
-    _suffix = "_reshaped"
-
-
-    def _run_interface(self, runtime):
-        #tmpDir = tempfile.mkdtemp()
         if not isdefined(self.inputs.out_file):
             self.inputs.out_file = fname_presuffix(self.inputs.in_file, suffix=self._suffix)
-    
-        infile = volumeFromFile(self.inputs.in_file)      
-        rank=10
-        #If there is no "time" dimension (i.e., in 3D file), then set nFrames to 1
-        try: 
-            nFrames = infile.sizes[infile.dimnames.index("time")]
-            first=int(ceil(float(nFrames*rank)/100))
-            last=int(nFrames)-int(ceil(float(nFrames*4*rank)/100))
-            count=last-first
-            run_mincreshape=ReshapeCommand()
-            run_mincreshape.inputs.dimrange = 'time='+str(first)+','+str(count)
-            run_mincreshape.inputs.in_file = self.inputs.in_file
-            run_mincreshape.inputs.out_file = self.inputs.out_file 
-            if self.inputs.verbose:
-                print run_mincreshape.cmdline
-            if self.inputs.run:
-                run_mincreshape.run()
-        except ValueError : 
-            self.inputs.out_file = self.inputs.in_file 
-
-        return runtime
-
-
-    def _list_outputs(self):
-        outputs = self.output_spec().get()
-        outputs["out_file"] = self.inputs.out_file
         return outputs
 
+"""
+.. module:: initialization
+    :platform: Unix
+    :synopsis: Workflow to initialize PET images
+.. moduleauthor:: Thomas Funck <tffunck@gmail.com>
+"""
 
+def get_workflow(name, infosource, opts):
+    '''
+    Nipype workflow that initializes the PET images by
+        1. Centering the PET image: petCenter
+        2. Exlcude start and end frames: petExcludeFr
+        3. Average 4D PET image into 3D image: petVolume
+        4. Extract information from header
 
-def get_workflow(name, infosource, datasink, opts):
+    :param name: Name of workflow
+    :param infosource: Infosource for basic variables like subject id (sid) and condition id (cid)
+    :param datasink: Node in which output data is sent
+    :param opts: User options
 
+    :returns: workflow
+    '''
     workflow = pe.Workflow(name=name)
 
     #Define input node that will receive input from outside of workflow
-    default_field=["pet"] # ["pet", "t1"]
+    default_field=["pet","pet_header_json"]
     inputnode = pe.Node(niu.IdentityInterface(fields=default_field), name='inputnode')
 
     #Define empty node for output
-    outputnode = pe.Node(niu.IdentityInterface(fields=["pet_header_dict","pet_header_json","pet_center","pet_volume"]), name='outputnode')
+    outputnode = pe.Node(niu.IdentityInterface(fields=["pet_volume","pet_header_json","pet_brain_mask"]), name='outputnode')
 
-    #get_steps = pe.Node(interface=get_stepCommand(), name="get_steps")
-    #workflow.connect(inputnode, 't1', get_steps, 'in_file')
+    petVolume = pe.Node(interface=pet3DVolume(), name="petVolume")
+    petVolume.inputs.verbose = opts.verbose
     
-    #node_name="petResample"
-    #petResample= pe.Node(interface=ResampleCommand(), name=node_name)
-    #petResample.inputs.interpolation = 'trilinear'
-	#petResample.inputs.tfm_input_sampling = True
-    #workflow.connect(inputnode, 'pet', petResample, 'in_file')
-    #workflow.connect(get_steps, 'step', petResample, 'step')
-	
-
-    node_name="petCenter"
-    petCenter= pe.Node(interface=VolCenteringRunning(), name=node_name)
-    petCenter.inputs.verbose = opts.verbose
-    petCenter.inputs.run = opts.prun    
-    rPetCenter=pe.Node(interface=Rename(format_string="%(sid)s_%(cid)s_"+node_name+".mnc"), name="r"+node_name)
-
-    node_name="petExcludeFr"
-    petExFr = pe.Node(interface=PETexcludeFrRunning(), name=node_name)
-    petExFr.inputs.verbose = opts.verbose   
-    petExFr.inputs.run = opts.prun
-    rPetExFr=pe.Node(interface=Rename(format_string="%(sid)s_%(cid)s_"+node_name+".mnc"), name="r"+node_name)
-
-
-    node_name="petVolume"
-    petVolume = pe.Node(interface=minc.Average(), name=node_name)
-    #MIC: petVolume = pe.Node(interface=minc.AverageCommand(), name=node_name)
-    petVolume.inputs.avgdim = 'time'
-    petVolume.inputs.width_weighted = True
-    petVolume.inputs.clobber = True
-    petVolume.inputs.verbose = opts.verbose 
-    rPetVolume=pe.Node(interface=Rename(format_string="%(sid)s_%(cid)s_"+node_name+".mnc"), name="r"+node_name)
-
-
-    node_name="petBlur"
-    #MIC: petBlur = pe.Node(interface=minc.SmoothCommand(), name=node_name)
-    petBlur = pe.Node(interface=minc.Blur(), name=node_name)
-    petBlur.inputs.fwhm = 3
-    petBlur.inputs.clobber = True
-    #MIC: petBlur.inputs.verbose = opts.verbose 
-
-    node_name="petSettings"
-    petSettings = pe.Node(interface=MincHdrInfoRunning(), name=node_name)
-    petSettings.inputs.verbose = opts.verbose
-    petSettings.inputs.clobber = True
-    petSettings.inputs.run = opts.prun
-    rPetSettings=pe.Node(interface=Rename(format_string="%(sid)s_%(cid)s_"+node_name+".mnc"), name="r"+node_name)
-
-    # node_name="petCenterSettings"
-    # petCenterSettings = pe.Node(interface=MincHdrInfoRunning(), name=node_name)
-    # petCenterSettings.inputs.verbose = opts.verbose
-    # petCenterSettings.inputs.clobber = True
-    # petCenterSettings.inputs.run = opts.prun
-    # rPetSettings=pe.Node(interface=Rename(format_string="%(study_prefix)s_%(sid)s_%(cid)s_"+node_name+".mnc"), name="r"+node_name)
-
-
-    # workflow.connect([(inputnode, petSettings, [('pet', 'in_file')])])
-    workflow.connect([(inputnode, petCenter, [('pet', 'in_file')])])
-
-    workflow.connect([(petCenter, rPetCenter, [('out_file', 'in_file')])])
-    workflow.connect([#(infosource, rPetCenter, [('study_prefix', 'study_prefix')]),
-                      (infosource, rPetCenter, [('sid', 'sid')]),
-                      (infosource, rPetCenter, [('cid', 'cid')])
-                    ])
-    #workflow.connect(rPetCenter, 'out_file', datasink, 'coregistered')
-
-    # workflow.connect([(petCenter, petCenterSettings, [('out_file', 'in_file')])])
-    workflow.connect([(petCenter, petSettings, [('out_file', 'in_file')])])
-
-    workflow.connect([(petCenter, petExFr, [('out_file', 'in_file')])])
-    workflow.connect([(petExFr, rPetExFr, [('out_file', 'in_file')])])
-    workflow.connect([#(infosource, rPetExFr, [('study_prefix', 'study_prefix')]),
-                      (infosource, rPetExFr, [('sid', 'sid')]),
-                      (infosource, rPetExFr, [('cid', 'cid')])
-                    ])
-    #workflow.connect(rPetExFr, 'out_file', datasink, petExFr.name)
-
-
-    #MIC: workflow.connect([(rPetExFr, petVolume, [('out_file', 'in_file')])])
-    workflow.connect([(rPetExFr, petVolume, [('out_file', 'input_files')])])
-
-    #MIC: workflow.connect([(petVolume, petBlur, [('out_file', 'in_file')])])
-    workflow.connect([(petVolume, petBlur, [('output_file', 'input_file')])])
-    #MIC: workflow.connect([(petBlur, rPetVolume, [('out_file', 'in_file')])])
-    workflow.connect([(petBlur, rPetVolume, [('output_file', 'in_file')])])
-   
-   
-    workflow.connect([#(infosource, rPetVolume, [('study_prefix', 'study_prefix')]),
-                      (infosource, rPetVolume, [('sid', 'sid')]),
-                      (infosource, rPetVolume, [('cid', 'cid')])
-                    ])
-    #workflow.connect(petBlur, 'out_file', datasink, petVolume.name)
-
-
-    workflow.connect(petSettings, 'header', outputnode, 'pet_header_dict')
-    workflow.connect(petSettings, 'out_file', outputnode, 'pet_header_json')
-    workflow.connect(rPetCenter, 'out_file', outputnode, 'pet_center')
-    workflow.connect(rPetVolume, 'out_file', outputnode, 'pet_volume')
-
     
+    petHeader=pe.Node(interface=validate_header(), name="petHeader")
+    if opts.quant_method != None :
+        petHeader.inputs.quant_method=opts.quant_method
+    
+    workflow.connect(inputnode, 'pet_header_json', petHeader, 'in_file')
+    
+    workflow.connect(inputnode, 'pet', petVolume, 'in_file')
+   
+    if opts.pet_brain_mask :
+        petBrainMask=pe.Node(pet_brain_mask(), "pet_brain_mask")
+        workflow.connect(petVolume, 'out_file', petBrainMask, 'in_file')
+        workflow.connect(petBrainMask, 'out_file', outputnode, 'pet_brain_mask')
+    
+    workflow.connect(petVolume, 'out_file', outputnode, 'pet_volume')
+    workflow.connect(petHeader, 'out_file', outputnode, 'pet_header_json')
+
     return(workflow)

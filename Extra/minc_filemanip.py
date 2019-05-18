@@ -11,8 +11,6 @@ import shutil
 
 import numpy as np
 
-from nipype.interfaces.traits_extension import isdefined
-from nipype.utils.misc import is_container
 
 #from nipype.utils import logging, config
 #fmlogger = logging.getLogger("filemanip")
@@ -28,10 +26,10 @@ def update_minchd_json(filename, data_in, var, attr):
 
     if data.get(var,'None') == 'None':
     	data[var]={attr:data_in}
-    else:
+    else :
     	if data.get(var).get(attr,'None') == 'None':
 	    data[var][attr]=data_in
-    	else:
+    	else :
 	    data[var][attr]=[data[var][attr],data_in]
     
     fp = file(filename, 'w')

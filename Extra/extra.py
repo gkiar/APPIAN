@@ -5,10 +5,43 @@ from nipype.interfaces.utility import Function
 from nipype.interfaces.base import (TraitedSpec, File, traits, InputMultiPath, 
                                     BaseInterface, OutputMultiPath, BaseInterfaceInputSpec, isdefined)
 from nipype.utils.filemanip import (load_json, save_json, split_filename, fname_presuffix, copyfile)
-#from nipype.interfaces.base import CommandLine, CommandLineInputSpec
+from Extra.utils import splitext
+import nibabel as nib
 import ntpath
 import pandas as pd
 import os
+import shutil
+import numpy as np 
+
+
+class copyOutput(TraitedSpec):
+	output_file=traits.File(argstr="%s", desc="input")
+
+class copyInput(TraitedSpec):
+	input_file=traits.File(argstr="%s", desc="input")
+	output_file=traits.File(argstr="%s", desc="output")
+
+class copyCommand(BaseInterface ):
+    input_spec = copyInput  
+    output_spec = copyOutput
+   
+    def _run_interface(self, runtime):
+        if not isdefined(self.inputs.output_file) :
+            self.inputs.output_file = self._gen_output(self.inputs.input_file)
+        shutil.copy(self.inputs.input_file, self.inputs.output_file)
+	return(runtime)
+
+    def _gen_output(self, fn) :
+        return os.getcwd() + os.sep +  os.path.basename( fn ) 
+
+    def _list_outputs(self):
+        outputs = self.output_spec().get()
+
+        if not isdefined(self.inputs.output_file) :
+            self.inputs.output_file = self._gen_output(self.inputs.input_file)
+
+        outputs["output_file"] = self.inputs.output_file
+        return outputs
 
 
 
@@ -67,5 +100,53 @@ class subject_parameterCommand(BaseInterface ):
     def _list_outputs(self):
         outputs = self.output_spec().get()
         outputs["parameter"] = self.inputs.parameter
+        return outputs
+
+
+
+class separate_mask_labelsOutput(TraitedSpec):
+	out_file=traits.File(argstr="%s", desc="4D label image")
+
+class separate_mask_labelsInput(TraitedSpec):
+	in_file=traits.File(argstr="%s", desc="3D label image")
+	out_file=traits.File(argstr="%s", desc="4D label image")
+
+class separate_mask_labelsCommand(BaseInterface ):
+    input_spec = separate_mask_labelsInput  
+    output_spec = separate_mask_labelsOutput
+   
+    def _run_interface(self, runtime):
+        vol = nib.load(self.inputs.in_file)
+        data = vol.get_data()
+
+        if not isdefined(self.inputs.out_file) :
+            self.inputs.out_file = self._gen_outputs(self.inputs.in_file)
+        
+        unique = np.unique( data )
+
+        nUnique = len(unique)-1
+
+        out = np.zeros( [data.shape[0], data.shape[1], data.shape[2], nUnique] )
+
+        for t,i in enumerate( unique ) :
+            if i != 0 :
+                print(t, i )
+                out[ data == i, t-1 ] = 1 
+        
+        out_file=nib.Nifti1Image(out, vol.get_affine())
+	out_file.to_filename(self.inputs.out_file)
+        return(runtime)
+
+    def _gen_outputs(self, fn) :
+        fn_split = splitext(fn)
+        return os.getcwd() + os.sep +  os.path.basename( fn_split[0] ) + "_4d" + fn_split[1]
+
+    def _list_outputs(self):
+        outputs = self.output_spec().get()
+
+        if not isdefined(self.inputs.out_file) :
+            self.inputs.out_file = self._gen_outputs(self.inputs.in_file)
+
+        outputs["out_file"] = self.inputs.out_file
         return outputs
 	
